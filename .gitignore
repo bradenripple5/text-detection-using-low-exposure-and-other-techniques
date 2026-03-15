@@ -1,0 +1,15 @@
+.gradle/
+.gradle-cache/
+.idea/
+local.properties
+
+build/
+app/build/
+*.apk
+*.ap_
+
+# Keep the dependency out of git and document how to re-download it.
+app/libs/opencv-release.aar
+
+# Local scratch/debug artifacts.
+debug_for_codex/

@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">Low Exposure Camera</string>
+    <string name="capture_button">Capture Low-Exposure Frame</string>
+    <string name="capture_button_off">Capture Off</string>
+    <string name="exposure_label">Exposure</string>
+    <string name="iso_label">ISO</string>
+    <string name="status_idle">Camera ready in normal lighting.</string>
+    <string name="status_normal_mode">Normal lighting detected.</string>
+    <string name="status_low_light_mode">Low light detected – optimizing for text.</string>
+    <string name="torch_label">Camera light</string>
+    <string name="low_light_toggle_label">Low-light detection</string>
+    <string name="status_capturing">Capturing text...</string>
+    <string name="status_detected_text">Detected %1$d text blocks at %2$d ms</string>
+    <string name="exposure_info_format">Exposure %1$.2f ms | ISO %2$d</string>
+    <string name="status_auto_exposure_locked">Auto exposure locked.</string>
+    <string name="status_auto_exposure_adjusted">Auto exposure updated.</string>
+    <string name="toast_auto_exposure_wait">Need a fresh frame before auto exposure can lock.</string>
+    <string name="license_plate_toggle_label">License plates only</string>
+    <string name="phone_toggle_label">Phone numbers only</string>
+</resources>
