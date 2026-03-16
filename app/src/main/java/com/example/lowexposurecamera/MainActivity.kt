@@ -1,6 +1,10 @@
 package com.example.lowexposurecamera
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -23,6 +27,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.net.Uri
 import android.util.Log
 import android.util.SparseIntArray
 import android.util.Size
@@ -103,6 +108,10 @@ class MainActivity : AppCompatActivity() {
     private var consecutiveDetectionMisses = 0
     @Volatile
     private var isOpenCvReady = false
+    private var lastVisibleDetections: List<TextOverlayView.Detection> = emptyList()
+    private var lastVisibleDetectionTimestampMs: Long = Long.MIN_VALUE
+    private var pendingCapturedFrameCount = 0
+    private val capturedFrameTexts = mutableListOf<String>()
 
     private val imageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
@@ -173,6 +182,9 @@ class MainActivity : AppCompatActivity() {
         setupLicensePlateToggle()
         setupPhoneToggle()
         setupTorchToggle()
+        setupBoxesOnlyToggle()
+        setupCaptureTextAction()
+        setupDetectionTapAction()
         ensureOpenCvReady()
     }
 
@@ -235,6 +247,52 @@ class MainActivity : AppCompatActivity() {
                 return@setOnCheckedChangeListener
             }
             setTorchEnabled(isChecked)
+        }
+    }
+
+    private fun setupBoxesOnlyToggle() {
+        binding.boxesOnlyToggle.isChecked = false
+        binding.textOverlay.showLabels = !binding.boxesOnlyToggle.isChecked
+        binding.boxesOnlyToggle.setOnCheckedChangeListener { _, isChecked ->
+            binding.textOverlay.showLabels = !isChecked
+        }
+    }
+
+    private fun setupCaptureTextAction() {
+        binding.captureTextButton.setOnClickListener {
+            pendingCapturedFrameCount = CAPTURE_TEXT_FRAME_COUNT
+            capturedFrameTexts.clear()
+            Toast.makeText(
+                this,
+                getString(R.string.capture_text_started, CAPTURE_TEXT_FRAME_COUNT),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    private fun setupDetectionTapAction() {
+        binding.textOverlay.onDetectionTap = { detection ->
+            openDialerForDetection(detection.text)
+        }
+    }
+
+    private fun openDialerForDetection(detectedText: String) {
+        val dialableNumber = extractPhoneCandidates(detectedText)
+            .asSequence()
+            .map(::toDialablePhoneNumber)
+            .firstOrNull { it.isNotEmpty() }
+            .orEmpty()
+        if (dialableNumber.isEmpty()) {
+            Toast.makeText(this, "No phone number found in that box.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dialIntent = Intent(Intent.ACTION_DIAL).apply {
+            data = Uri.parse("tel:${Uri.encode(dialableNumber, "+")}")
+        }
+        try {
+            startActivity(dialIntent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "No dialer app is available.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -480,7 +538,8 @@ class MainActivity : AppCompatActivity() {
                         image.width,
                         image.height,
                         rotationDegrees,
-                        false
+                        false,
+                        timestampMs
                     )
                     updateDetectionHistory(detections)
                     runOnUiThread {
@@ -526,7 +585,8 @@ class MainActivity : AppCompatActivity() {
                         overlayWidth,
                         overlayHeight,
                         rotationDegrees,
-                        isSourceAligned
+                        isSourceAligned,
+                        timestampMs
                     )
                     runOnUiThread {
                         updateStatus(
@@ -597,10 +657,26 @@ class MainActivity : AppCompatActivity() {
         width: Int,
         height: Int,
         rotationDegrees: Int,
-        sourceAlreadyAligned: Boolean
+        sourceAlreadyAligned: Boolean,
+        timestampMs: Long
     ) {
         runOnUiThread {
-            if (detections.isEmpty()) {
+            val detectionsToShow = when {
+                detections.isNotEmpty() -> {
+                    lastVisibleDetections = detections.map(::copyDetection)
+                    lastVisibleDetectionTimestampMs = timestampMs
+                    detections
+                }
+                timestampMs - lastVisibleDetectionTimestampMs <= DETECTION_HOLD_MS -> {
+                    lastVisibleDetections.map(::copyDetection)
+                }
+                else -> {
+                    lastVisibleDetections = emptyList()
+                    emptyList()
+                }
+            }
+            captureFrameTextIfRequested(detectionsToShow)
+            if (detectionsToShow.isEmpty()) {
                 binding.textOverlay.clear()
             } else {
                 val rotatedWidth: Int
@@ -612,10 +688,44 @@ class MainActivity : AppCompatActivity() {
                     rotatedWidth = height
                     rotatedHeight = width
                 }
-                binding.textOverlay.updateDetections(rotatedWidth, rotatedHeight, detections)
+                binding.textOverlay.updateDetections(rotatedWidth, rotatedHeight, detectionsToShow)
             }
         }
     }
+
+    private fun captureFrameTextIfRequested(detections: List<TextOverlayView.Detection>) {
+        if (pendingCapturedFrameCount <= 0) {
+            return
+        }
+        capturedFrameTexts += formatCapturedFrameText(detections)
+        pendingCapturedFrameCount--
+        if (pendingCapturedFrameCount > 0) {
+            return
+        }
+        val capturedText = capturedFrameTexts.joinToString(separator = "\n-----\n")
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(ClipData.newPlainText(getString(R.string.capture_text_label), capturedText))
+        Toast.makeText(this, getString(R.string.capture_text_copied), Toast.LENGTH_SHORT).show()
+    }
+
+    private fun formatCapturedFrameText(detections: List<TextOverlayView.Detection>): String =
+        detections
+            .map { it.text.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString(separator = "\n")
+            .ifBlank { getString(R.string.capture_text_empty_frame) }
+
+    private fun copyDetection(detection: TextOverlayView.Detection): TextOverlayView.Detection =
+        TextOverlayView.Detection(
+            text = detection.text,
+            bounds = RectF(detection.bounds),
+            frameDeltaMs = detection.frameDeltaMs,
+            count = detection.count,
+            previousBounds = detection.previousBounds?.let(::RectF),
+            isTrackingBitmap = detection.isTrackingBitmap,
+            isDialable = detection.isDialable
+        )
 
     private fun adjustDetectionsForCrop(
         detections: List<TextOverlayView.Detection>,
@@ -637,7 +747,8 @@ class MainActivity : AppCompatActivity() {
                 detection.frameDeltaMs,
                 detection.count,
                 adjustedPrevious,
-                detection.isTrackingBitmap
+                detection.isTrackingBitmap,
+                detection.isDialable
             )
         }
     }
@@ -753,6 +864,20 @@ class MainActivity : AppCompatActivity() {
         val shouldFilterForPlates = isLicensePlateFilterEnabled && !isPhoneDetectionEnabled
         val nextBoundsByKey = mutableMapOf<String, RectF>()
         text.textBlocks.forEach { block ->
+            if (isPhoneDetectionEnabled) {
+                val blockBounds = block.boundingBox
+                if (blockBounds != null) {
+                    extractPhoneCandidates(block.text).forEach { candidate ->
+                        addPhoneDetectionCandidate(
+                            detections = detections,
+                            nextBoundsByKey = nextBoundsByKey,
+                            candidateText = candidate,
+                            bounds = RectF(blockBounds),
+                            frameDeltaMs = frameDeltaMs
+                        )
+                    }
+                }
+            }
             block.lines.forEach lineLoop@{ line ->
                 val bounds = line.boundingBox ?: return@lineLoop
                 val normalizedText = line.text.trim()
@@ -762,19 +887,14 @@ class MainActivity : AppCompatActivity() {
                 val key = normalizedText.uppercase(Locale.US)
                 val previousBounds = previousDetectionBounds[key]?.let { RectF(it) }
                 if (isPhoneDetectionEnabled) {
-                    if (isPhoneNumber(normalizedText)) {
-                        val count = detectionCounts.getOrDefault(key, 0) + 1
-                        detectionCounts[key] = count
-                        detections.add(
-                            TextOverlayView.Detection(
-                                normalizedText,
-                                RectF(bounds),
-                                frameDeltaMs,
-                                count,
-                                previousBounds
-                            )
+                    extractPhoneCandidates(normalizedText).forEach { candidate ->
+                        addPhoneDetectionCandidate(
+                            detections = detections,
+                            nextBoundsByKey = nextBoundsByKey,
+                            candidateText = candidate,
+                            bounds = RectF(bounds),
+                            frameDeltaMs = frameDeltaMs
                         )
-                        nextBoundsByKey[key] = RectF(bounds)
                     }
                 } else if (shouldFilterForPlates) {
                     val cleanedText = normalizedText.filter { it.isLetterOrDigit() }
@@ -787,7 +907,8 @@ class MainActivity : AppCompatActivity() {
                                 RectF(bounds),
                                 frameDeltaMs,
                                 count,
-                                previousBounds
+                                previousBounds,
+                                isDialable = containsDialablePhoneNumber(cleanedText)
                             )
                         )
                         nextBoundsByKey[key] = RectF(bounds)
@@ -801,7 +922,8 @@ class MainActivity : AppCompatActivity() {
                             RectF(bounds),
                             frameDeltaMs,
                             count,
-                            previousBounds
+                            previousBounds,
+                            isDialable = containsDialablePhoneNumber(normalizedText)
                         )
                     )
                     nextBoundsByKey[key] = RectF(bounds)
@@ -811,6 +933,55 @@ class MainActivity : AppCompatActivity() {
         previousDetectionBounds.clear()
         previousDetectionBounds.putAll(nextBoundsByKey)
         return detections
+    }
+
+    private fun extractPhoneCandidates(text: String): List<String> {
+        val normalized = normalizePhoneCandidateText(text)
+        if (normalized.isEmpty()) {
+            return emptyList()
+        }
+        val candidates = linkedSetOf<String>()
+        PHONE_CANDIDATE_REGEX.findAll(normalized).forEach { match ->
+            val candidate = match.value.trim(' ', '.', '-', '(', ')')
+            if (candidate.isNotEmpty()) {
+                candidates.add(candidate)
+            }
+        }
+        candidates.add(normalized)
+        return candidates.toList()
+    }
+
+    private fun containsDialablePhoneNumber(text: String): Boolean =
+        extractPhoneCandidates(text).any(::isPhoneNumber)
+
+    private fun addPhoneDetectionCandidate(
+        detections: MutableList<TextOverlayView.Detection>,
+        nextBoundsByKey: MutableMap<String, RectF>,
+        candidateText: String,
+        bounds: RectF,
+        frameDeltaMs: Long
+    ) {
+        if (!isPhoneNumber(candidateText)) {
+            return
+        }
+        val key = candidateText.uppercase(Locale.US)
+        if (nextBoundsByKey.containsKey(key)) {
+            return
+        }
+        val previousBounds = previousDetectionBounds[key]?.let { RectF(it) }
+        val count = detectionCounts.getOrDefault(key, 0) + 1
+        detectionCounts[key] = count
+        detections.add(
+            TextOverlayView.Detection(
+                candidateText,
+                RectF(bounds),
+                frameDeltaMs,
+                count,
+                previousBounds,
+                isDialable = true
+            )
+        )
+        nextBoundsByKey[key] = RectF(bounds)
     }
 
     private fun updatePhoneFocusRect(
@@ -865,11 +1036,62 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isPhoneNumber(text: String): Boolean {
-        val digits = text.filter { it.isDigit() }
-        if (digits.length !in MIN_PHONE_DIGITS..MAX_PHONE_DIGITS) {
+        val normalized = normalizeVanityPhoneText(normalizePhoneCandidateText(text).uppercase(Locale.US))
+        val digits = normalized.mapNotNull(::toPhoneKeypadDigit)
+        if (digits.size !in MIN_PHONE_DIGITS..MAX_PHONE_DIGITS) {
             return false
         }
-        return PHONE_NUMBER_PATTERN.containsMatchIn(text)
+        return PHONE_NUMBER_PATTERN.matches(normalized)
+    }
+
+    private fun normalizePhoneCandidateText(text: String): String = text
+        .trim()
+        .replace('\u2010', '-')
+        .replace('\u2011', '-')
+        .replace('\u2012', '-')
+        .replace('\u2013', '-')
+        .replace('\u2014', '-')
+        .replace('\u2212', '-')
+        .replace(Regex("\\s+"), " ")
+
+    private fun normalizeVanityPhoneText(text: String): String {
+        val chars = text.toCharArray()
+        for (index in chars.indices) {
+            if (chars[index] != '0') {
+                continue
+            }
+            val previousIsLetter = index > 0 && chars[index - 1].isLetter()
+            val nextIsLetter = index < chars.lastIndex && chars[index + 1].isLetter()
+            if (previousIsLetter || nextIsLetter) {
+                chars[index] = 'O'
+            }
+        }
+        return String(chars)
+    }
+
+    private fun toPhoneKeypadDigit(char: Char): Char? = when (char) {
+        in '0'..'9' -> char
+        'A', 'B', 'C' -> '2'
+        'D', 'E', 'F' -> '3'
+        'G', 'H', 'I' -> '4'
+        'J', 'K', 'L' -> '5'
+        'M', 'N', 'O' -> '6'
+        'P', 'Q', 'R', 'S' -> '7'
+        'T', 'U', 'V' -> '8'
+        'W', 'X', 'Y', 'Z' -> '9'
+        else -> null
+    }
+
+    private fun toDialablePhoneNumber(text: String): String {
+        val normalized = normalizeVanityPhoneText(normalizePhoneCandidateText(text).uppercase(Locale.US))
+        val result = StringBuilder(normalized.length)
+        normalized.forEachIndexed { index, char ->
+            when {
+                char == '+' && index == 0 -> result.append(char)
+                else -> toPhoneKeypadDigit(char)?.let(result::append)
+            }
+        }
+        return result.toString()
     }
 
     private fun getImageRotationDegrees(): Int {
@@ -1275,15 +1497,42 @@ class MainActivity : AppCompatActivity() {
             val updatedRect = Rect2d()
             val success = tracker.update(trackerMat, updatedRect)
             if (!success) {
-                deactivateDominantTracker()
-                null
+                trackerState.consecutiveMisses++
+                if (trackerState.consecutiveMisses > TRACKER_MISS_TOLERANCE) {
+                    deactivateDominantTracker()
+                    null
+                } else {
+                    TextOverlayView.Detection(
+                        trackerState.displayText,
+                        RectF(trackerState.currentRect),
+                        frameDeltaMs,
+                        trackerState.trackingCount,
+                        RectF(trackerState.currentRect),
+                        isTrackingBitmap = true,
+                        isDialable = true
+                    )
+                }
             } else {
                 val androidRect = updatedRect.toAndroidRect()
                 val clampedRect = clampRectToBounds(androidRect, frameWidth, frameHeight)
                 if (clampedRect.isEmpty) {
-                    deactivateDominantTracker()
-                    null
+                    trackerState.consecutiveMisses++
+                    if (trackerState.consecutiveMisses > TRACKER_MISS_TOLERANCE) {
+                        deactivateDominantTracker()
+                        null
+                    } else {
+                        TextOverlayView.Detection(
+                            trackerState.displayText,
+                            RectF(trackerState.currentRect),
+                            frameDeltaMs,
+                            trackerState.trackingCount,
+                            RectF(trackerState.currentRect),
+                            isTrackingBitmap = true,
+                            isDialable = true
+                        )
+                    }
                 } else {
+                    trackerState.consecutiveMisses = 0
                     val updatedCount = detectionCounts.getOrDefault(trackerState.key, 0) + 1
                     detectionCounts[trackerState.key] = updatedCount
                     trackerState.trackingCount = updatedCount
@@ -1296,14 +1545,28 @@ class MainActivity : AppCompatActivity() {
                         frameDeltaMs,
                         updatedCount,
                         previousBounds,
-                        isTrackingBitmap = true
+                        isTrackingBitmap = true,
+                        isDialable = true
                     )
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "MOSSE tracker update failed", e)
-            deactivateDominantTracker()
-            null
+            trackerState.consecutiveMisses++
+            if (trackerState.consecutiveMisses > TRACKER_MISS_TOLERANCE) {
+                deactivateDominantTracker()
+                null
+            } else {
+                TextOverlayView.Detection(
+                    trackerState.displayText,
+                    RectF(trackerState.currentRect),
+                    frameDeltaMs,
+                    trackerState.trackingCount,
+                    RectF(trackerState.currentRect),
+                    isTrackingBitmap = true,
+                    isDialable = true
+                )
+            }
         } finally {
             trackerMat.release()
         }
@@ -1396,6 +1659,7 @@ class MainActivity : AppCompatActivity() {
         var displayText: String,
         var currentRect: Rect,
         var trackingCount: Int = 0,
+        var consecutiveMisses: Int = 0,
         var tracker: legacy_Tracker? = null,
         var referenceRotation: Int = 0
     )
@@ -1415,8 +1679,8 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_FRAMES_PER_TEXT_DETECTION = 3
         private const val DETECTION_FORCE_AFTER_MISSES = 2
         private const val DRIFT_FORCE_DETECTION_THRESHOLD = 0.18f
-        private const val PHONE_FOCUS_WIDTH_SCALE = 1.5f
-        private const val PHONE_FOCUS_HEIGHT_SCALE = 3f
+        private const val PHONE_FOCUS_WIDTH_SCALE = 2.2f
+        private const val PHONE_FOCUS_HEIGHT_SCALE = 4.2f
         private const val PHONE_FALLBACK_WIDTH_RATIO = 0.45f
         private const val PHONE_FALLBACK_HEIGHT_RATIO = 0.7f
         private const val PHONE_MIN_FALLBACK_SIZE = 120
@@ -1428,9 +1692,18 @@ class MainActivity : AppCompatActivity() {
         private const val MIN_PLATE_CHAR_COUNT = 4
         private const val MIN_PHONE_DIGITS = 7
         private const val MAX_PHONE_DIGITS = 14
-        private val PHONE_NUMBER_PATTERN = Regex("""\+?[\d\-\s\(\)]{7,}""")
+        // Accept standard numeric formats plus vanity numbers such as 1-800-FLOWERS.
+        private val PHONE_NUMBER_PATTERN = Regex(
+            """^\+?(?=.*\d)(?=.*[A-Z\d])[A-Z\d\-\s\(\)\.]{6,}$"""
+        )
+        private val PHONE_CANDIDATE_REGEX = Regex(
+            """\+?[A-Z0-9][A-Z0-9\-\s\(\)\.]{6,}"""
+        )
         private const val DOMINANT_HISTORY_SIZE = 5
         private const val DOMINANT_RATIO_THRESHOLD = 0.8f
+        private const val TRACKER_MISS_TOLERANCE = 4
+        private const val DETECTION_HOLD_MS = 5_000L
+        private const val CAPTURE_TEXT_FRAME_COUNT = 5
         private const val COLUMN_MONITOR_X_RATIO = 0.5f
         private const val TRACKING_PATCH_RADIUS = 4
         private const val TRACKING_SEARCH_RADIUS = 12

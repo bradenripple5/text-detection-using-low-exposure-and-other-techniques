@@ -17,4 +17,10 @@
     <string name="toast_auto_exposure_wait">Need a fresh frame before auto exposure can lock.</string>
     <string name="license_plate_toggle_label">License plates only</string>
     <string name="phone_toggle_label">Phone numbers only</string>
+    <string name="boxes_only_toggle_label">Boxes only</string>
+    <string name="capture_text_label">Capture text</string>
+    <string name="capture_text_copied">Detected text copied.</string>
+    <string name="capture_text_empty">No detected text to capture.</string>
+    <string name="capture_text_empty_frame">No detected text in this frame.</string>
+    <string name="capture_text_started">Capturing text from %1$d frames...</string>
 </resources>
